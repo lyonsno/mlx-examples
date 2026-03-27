@@ -5,6 +5,7 @@ import os
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest import mock
 
 import mlx.core as mx
 import mlx_whisper
@@ -184,6 +185,76 @@ class TestWhisper(unittest.TestCase):
         self.assertAlmostEqual(result.avg_logprob, -0.4975455382774616, places=3)
         self.assertAlmostEqual(result.no_speech_prob, 0.009631240740418434, places=4)
         self.assertAlmostEqual(result.compression_ratio, 1.2359550561797752)
+
+    def test_decode_timeout_returns_partial_result(self):
+        full_result = decoding.decode(self.model, self.mels, fp16=False)
+
+        with (
+            mock.patch(
+                "mlx_whisper.decoding.time.monotonic",
+                side_effect=[100.0] + [101.0] * 20,
+            ),
+            self.assertLogs("mlx_whisper", level="WARNING") as logs,
+        ):
+            timed_out = decoding.decode(
+                self.model, self.mels, fp16=False, decode_timeout=0.5
+            )
+
+        self.assertIn("Decode timeout (0.5s) exceeded", logs.output[0])
+        self.assertEqual(timed_out.language, full_result.language)
+        self.assertLess(len(timed_out.tokens), len(full_result.tokens))
+        self.assertEqual(
+            timed_out.tokens, full_result.tokens[: len(timed_out.tokens)]
+        )
+
+    def test_decode_without_timeout_keeps_async_schedule(self):
+        eval_call_arities = []
+        async_call_arities = []
+        original_eval = decoding.mx.eval
+        original_async_eval = decoding.mx.async_eval
+
+        def traced_eval(*args, **kwargs):
+            eval_call_arities.append(len(args))
+            return original_eval(*args, **kwargs)
+
+        def traced_async_eval(*args, **kwargs):
+            async_call_arities.append(len(args))
+            return original_async_eval(*args, **kwargs)
+
+        with (
+            mock.patch.object(decoding.mx, "eval", side_effect=traced_eval),
+            mock.patch.object(
+                decoding.mx, "async_eval", side_effect=traced_async_eval
+            ),
+        ):
+            decoding.decode(self.model, self.mels, fp16=False)
+
+        self.assertNotIn(1, eval_call_arities)
+        self.assertIn(3, async_call_arities)
+
+    def test_transcribe_forwards_decode_timeout(self):
+        full_result = mlx_whisper.transcribe(
+            TEST_AUDIO, path_or_hf_repo=MLX_FP32_MODEL_PATH, fp16=False
+        )
+
+        with (
+            mock.patch(
+                "mlx_whisper.decoding.time.monotonic",
+                side_effect=[100.0] + [101.0] * 20,
+            ),
+            self.assertLogs("mlx_whisper", level="WARNING") as logs,
+        ):
+            timed_out = mlx_whisper.transcribe(
+                TEST_AUDIO,
+                path_or_hf_repo=MLX_FP32_MODEL_PATH,
+                fp16=False,
+                decode_timeout=0.5,
+            )
+
+        self.assertIn("Decode timeout (0.5s) exceeded", logs.output[0])
+        self.assertEqual(timed_out["language"], full_result["language"])
+        self.assertLess(len(timed_out["text"]), len(full_result["text"]))
+        self.assertTrue(full_result["text"].startswith(timed_out["text"]))
 
     def test_transcribe(self):
         result = mlx_whisper.transcribe(

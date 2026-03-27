@@ -117,9 +117,10 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
-    # safety: wall-clock timeout for decoding a single segment (seconds).
-    # None means no timeout (original behavior). When set, decoding is
-    # aborted and a partial result returned if the deadline is exceeded.
+    # safety: cooperative wall-clock timeout for decoding a single segment
+    # (seconds). None preserves the original async scheduling. When set, the
+    # deadline is checked after the initial decode step and between later
+    # decode steps; if exceeded, decoding stops and returns the partial result.
     decode_timeout: Optional[float] = None
 
 
@@ -610,7 +611,18 @@ class DecodingTask:
             no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech]
         else:
             no_speech_probs = mx.full(n_batch, mx.nan)
-        mx.async_eval(completed, tokens, sum_logprobs, no_speech_probs)
+        if deadline is not None:
+            mx.eval(completed, tokens, sum_logprobs, no_speech_probs)
+            if completed:
+                return tokens, sum_logprobs, no_speech_probs
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "Decode timeout (%.1fs) exceeded after the initial decode step",
+                    self.options.decode_timeout,
+                )
+                return tokens, sum_logprobs, no_speech_probs
+        else:
+            mx.async_eval(completed, tokens, sum_logprobs, no_speech_probs)
 
         for i in range(1, self.sample_len):
             if deadline is not None and time.monotonic() > deadline:
@@ -629,13 +641,28 @@ class DecodingTask:
             next_tokens, next_completed, next_sum_logprobs, _ = _step(
                 inputs, audio_features, tokens, sum_logprobs
             )
-            mx.eval(next_completed)
-            if completed:
-                break
-            tokens = next_tokens
-            completed = next_completed
-            sum_logprobs = next_sum_logprobs
-            mx.async_eval(next_tokens, next_sum_logprobs)
+            if deadline is not None:
+                mx.eval(next_completed, next_tokens, next_sum_logprobs)
+                tokens = next_tokens
+                completed = next_completed
+                sum_logprobs = next_sum_logprobs
+                if completed:
+                    break
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "Decode timeout (%.1fs) exceeded after iteration %d/%d",
+                        self.options.decode_timeout,
+                        i,
+                        self.sample_len,
+                    )
+                    break
+            else:
+                mx.async_eval(next_completed, next_tokens, next_sum_logprobs)
+                if completed:
+                    break
+                tokens = next_tokens
+                completed = next_completed
+                sum_logprobs = next_sum_logprobs
 
         return tokens, sum_logprobs, no_speech_probs
 
