@@ -5,6 +5,7 @@ import os
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest import mock
 
 import mlx.core as mx
 import mlx_whisper
@@ -184,6 +185,64 @@ class TestWhisper(unittest.TestCase):
         self.assertAlmostEqual(result.avg_logprob, -0.4975455382774616, places=3)
         self.assertAlmostEqual(result.no_speech_prob, 0.009631240740418434, places=4)
         self.assertAlmostEqual(result.compression_ratio, 1.2359550561797752)
+
+    def test_eager_eval_matches_default_decode(self):
+        default_result = decoding.decode(self.model, self.mels, fp16=False)
+        eager_result = decoding.decode(
+            self.model, self.mels, fp16=False, eager_eval=True
+        )
+
+        self.assertEqual(eager_result.language, default_result.language)
+        self.assertEqual(eager_result.tokens, default_result.tokens)
+        self.assertEqual(eager_result.text, default_result.text)
+        self.assertAlmostEqual(
+            eager_result.avg_logprob, default_result.avg_logprob, places=6
+        )
+        self.assertAlmostEqual(
+            eager_result.no_speech_prob, default_result.no_speech_prob, places=6
+        )
+        self.assertAlmostEqual(
+            eager_result.compression_ratio,
+            default_result.compression_ratio,
+            places=6,
+        )
+
+    def test_eager_eval_switches_decode_schedule(self):
+        def collect_call_arities(*, eager_eval):
+            eval_call_arities = []
+            async_call_arities = []
+            original_eval = decoding.mx.eval
+            original_async_eval = decoding.mx.async_eval
+
+            def traced_eval(*args, **kwargs):
+                eval_call_arities.append(len(args))
+                return original_eval(*args, **kwargs)
+
+            def traced_async_eval(*args, **kwargs):
+                async_call_arities.append(len(args))
+                return original_async_eval(*args, **kwargs)
+
+            with (
+                mock.patch.object(decoding.mx, "eval", side_effect=traced_eval),
+                mock.patch.object(
+                    decoding.mx, "async_eval", side_effect=traced_async_eval
+                ),
+            ):
+                decoding.decode(self.model, self.mels, fp16=False, eager_eval=eager_eval)
+
+            return eval_call_arities, async_call_arities
+
+        default_eval_arities, default_async_arities = collect_call_arities(
+            eager_eval=False
+        )
+        eager_eval_arities, eager_async_arities = collect_call_arities(
+            eager_eval=True
+        )
+
+        self.assertNotIn(1, default_eval_arities)
+        self.assertNotIn(2, default_async_arities)
+        self.assertIn(1, eager_eval_arities)
+        self.assertIn(2, eager_async_arities)
 
     def test_transcribe(self):
         result = mlx_whisper.transcribe(

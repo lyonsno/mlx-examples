@@ -1,7 +1,4 @@
 # Copyright © 2023 Apple Inc.
-
-import logging
-import time
 import zlib
 from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -117,10 +114,9 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
-    # safety: wall-clock timeout for decoding a single segment (seconds).
-    # None means no timeout (original behavior). When set, decoding is
-    # aborted and a partial result returned if the deadline is exceeded.
-    decode_timeout: Optional[float] = None
+    # If True, eagerly wait for the completion signal each decode step instead
+    # of relying on fully async evaluation.
+    eager_eval: bool = False
 
 
 @dataclass(frozen=True)
@@ -577,14 +573,8 @@ class DecodingTask:
         return languages, lang_probs
 
     def _main_loop(self, audio_features: mx.array, tokens: mx.array):
-        logger = logging.getLogger("mlx_whisper")
         n_batch = tokens.shape[0]
         sum_logprobs = mx.zeros(n_batch)
-        deadline = (
-            time.monotonic() + self.options.decode_timeout
-            if self.options.decode_timeout is not None
-            else None
-        )
 
         def _step(inputs, audio_features, tokens, sum_logprobs):
             pre_logits = self.inference.logits(inputs, audio_features)
@@ -613,15 +603,6 @@ class DecodingTask:
         mx.async_eval(completed, tokens, sum_logprobs, no_speech_probs)
 
         for i in range(1, self.sample_len):
-            if deadline is not None and time.monotonic() > deadline:
-                logger.warning(
-                    "Decode timeout (%.1fs) exceeded at iteration %d/%d",
-                    self.options.decode_timeout,
-                    i,
-                    self.sample_len,
-                )
-                break
-
             inputs = tokens[:, -1:]
             if tokens.shape[-1] > self.n_ctx:
                 break
@@ -629,13 +610,16 @@ class DecodingTask:
             next_tokens, next_completed, next_sum_logprobs, _ = _step(
                 inputs, audio_features, tokens, sum_logprobs
             )
-            mx.eval(next_completed)
+            if self.options.eager_eval:
+                mx.eval(next_completed)
+                mx.async_eval(next_tokens, next_sum_logprobs)
+            else:
+                mx.async_eval(next_completed, next_tokens, next_sum_logprobs)
             if completed:
                 break
             tokens = next_tokens
             completed = next_completed
             sum_logprobs = next_sum_logprobs
-            mx.async_eval(next_tokens, next_sum_logprobs)
 
         return tokens, sum_logprobs, no_speech_probs
 
